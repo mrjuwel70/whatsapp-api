@@ -1,0 +1,16 @@
+{
+  "name": "whatsapp-api-backend",
+  "version": "1.0.0",
+  "description": "WhatsApp API Gateway Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.6.0",
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "body-parser": "^1.20.2",
+    "qrcode": "^1.5.3"
+  }
+}
