@@ -1,96 +1,138 @@
 const express = require('express');
 const cors = require('cors');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// সেশনগুলো memory তে রাখা হবে
 const sessions = new Map();
-const sessionsDir = path.join(__dirname, 'sessions');
-if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir);
 
+// হোম পেজ - চেক করার জন্য
 app.get('/', (req, res) => {
-    res.json({ status: 'running', message: 'WhatsApp API Server is running', sessions: sessions.size });
+    res.json({ 
+        status: 'running', 
+        message: 'WhatsApp API Server is running', 
+        sessions: sessions.size 
+    });
 });
 
+// সেশন তৈরি ও QR কোড জেনারেট
 app.post('/create-session', async (req, res) => {
     const { sessionId } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    console.log(`Session creation requested for: ${sessionId}`);
     
+    if (!sessionId) {
+        return res.status(400).json({ error: 'sessionId required' });
+    }
+    
+    // যদি ইতিমধ্যে সেশন থাকে
     if (sessions.has(sessionId)) {
         return res.json({ message: 'Session already exists', qr: null });
     }
     
-    let qrSent = false;
+    // টাইমআউট সেট করুন (যদি ২ মিনিটের মধ্যে QR না আসে)
     const timeout = setTimeout(() => {
-        if (!qrSent) res.status(408).json({ error: 'QR generation timeout' });
-    }, 60000);
+        console.log(`Session ${sessionId} timed out`);
+        if (!res.headersSent) {
+            res.status(408).json({ error: 'QR generation timeout' });
+        }
+    }, 120000);
     
     try {
-        const authPath = path.join(sessionsDir, sessionId);
-        const { state, saveCreds } = await useMultiFileAuthState(authPath);
-        const sock = makeWASocket({ auth: state, printQRInTerminal: false });
+        // অথেন্টিকেশন স্টেট লোড করুন
+        const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${sessionId}`);
         
+        // সকেট তৈরি করুন
+        const sock = makeWASocket({
+            auth: state,
+            printQRInTerminal: false,
+            browser: ['WhatsApp API Gateway', 'Chrome', '1.0.0']
+        });
+        
+        // সংযোগ আপডেট শুনুন
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
-            if (qr && !qrSent) {
-                qrSent = true;
+            if (qr) {
+                console.log(`QR generated for ${sessionId}`);
                 clearTimeout(timeout);
-                const qrBuffer = await QRCode.toBuffer(qr);
-                res.json({ qr: qr, status: 'qr_ready' });
+                
+                // QR কোডটি ক্লায়েন্টকে পাঠান
+                if (!res.headersSent) {
+                    res.json({ qr: qr, status: 'qr_ready' });
+                }
             }
             
             if (connection === 'open') {
+                console.log(`✅ Session ${sessionId} connected successfully`);
                 sessions.set(sessionId, sock);
-                console.log(`✅ Session ${sessionId} connected`);
+                
+                // ক্রেডেনশিয়াল সংরক্ষণ করুন
                 sock.ev.on('creds.update', saveCreds);
             }
             
             if (connection === 'close') {
+                console.log(`❌ Session ${sessionId} disconnected`);
                 sessions.delete(sessionId);
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                if (statusCode === DisconnectReason.loggedOut) {
-                    fs.rmSync(authPath, { recursive: true, force: true });
-                }
             }
         });
+        
     } catch (error) {
+        console.error(`Error creating session ${sessionId}:`, error);
         clearTimeout(timeout);
-        res.status(500).json({ error: error.message });
+        if (!res.headersSent) {
+            res.status(500).json({ error: error.message });
+        }
     }
 });
 
+// মেসেজ পাঠানোর এন্ডপয়েন্ট
 app.post('/send-message', async (req, res) => {
     const { sessionId, number, message } = req.body;
+    console.log(`Send message request: ${sessionId}, ${number}`);
+    
     const sock = sessions.get(sessionId);
-    if (!sock) return res.status(404).json({ error: 'Session not found. Please connect WhatsApp first.' });
+    if (!sock) {
+        return res.status(404).json({ error: 'Session not found. Please connect WhatsApp first.' });
+    }
     
     try {
+        // নম্বর ফরম্যাট করুন
         let formattedNumber = number.toString().replace(/[^0-9]/g, '');
-        if (formattedNumber.startsWith('01')) formattedNumber = '88' + formattedNumber;
-        if (!formattedNumber.endsWith('@c.us')) formattedNumber = formattedNumber + '@c.us';
+        if (formattedNumber.startsWith('01')) {
+            formattedNumber = '88' + formattedNumber;
+        }
+        if (!formattedNumber.endsWith('@c.us')) {
+            formattedNumber = formattedNumber + '@c.us';
+        }
         
+        console.log(`Sending message to: ${formattedNumber}`);
         await sock.sendMessage(formattedNumber, { text: message });
+        
         res.json({ success: true, message: 'Message sent successfully' });
     } catch (error) {
+        console.error('Send message error:', error);
         res.status(500).json({ error: error.message });
     }
 });
 
+// সেশন স্ট্যাটাস চেক করুন
 app.get('/session-status/:sessionId', (req, res) => {
     const { sessionId } = req.params;
-    res.json({ connected: sessions.has(sessionId) });
+    const connected = sessions.has(sessionId);
+    res.json({ connected: connected });
 });
 
+// ডিসকানেক্ট করুন
 app.post('/disconnect', async (req, res) => {
     const { sessionId } = req.body;
     if (sessions.has(sessionId)) {
-        await sessions.get(sessionId).logout();
+        try {
+            await sessions.get(sessionId).logout();
+        } catch(e) {}
         sessions.delete(sessionId);
         res.json({ success: true });
     } else {
@@ -98,5 +140,8 @@ app.post('/disconnect', async (req, res) => {
     }
 });
 
+// সার্ভার চালু করুন
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`🚀 WhatsApp API Server running on port ${PORT}`);
+});
